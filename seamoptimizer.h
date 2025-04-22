@@ -20,6 +20,8 @@
 #define SO_FREE(ptr) free(ptr)
 #endif
 
+#define SEAMOPTIMIZER_IMPLEMENTATION 1
+
 typedef int so_bool;
 #define SO_FALSE 0
 #define SO_TRUE  1
@@ -851,6 +853,12 @@ static void so_matrix_At_times_b(const float *A, int m, int n, const float *b, f
 	}
 }
 
+/*
+实现了稀疏矩阵的 Cholesky 分解预处理，用于求解线性方程组
+- 对输入的稀疏对称正定矩阵 AtA 进行 Cholesky 分解，得到下三角矩阵 L
+- 采用稀疏存储格式，只计算和存储非零元素
+- 用于后续的线性方程组求解
+*/
 static so_sparse_entries_t so_matrix_cholesky_prepare(so_sparse_entries_t *AtA, int n)
 {
 	// dense
@@ -875,9 +883,9 @@ static so_sparse_entries_t so_matrix_cholesky_prepare(so_sparse_entries_t *AtA, 
 	//}
 	
 	// sparse
-	int *indices_i;
-	float *row_i;
-	float *invDiag;
+    int *indices_i;  // 存储当前行非零元素的列索引
+    float *row_i;    // 存储当前行的临时值
+    float *invDiag;  // 存储对角线元素的倒数
 
 	if (n > 4096)
 	{
@@ -892,22 +900,28 @@ static so_sparse_entries_t so_matrix_cholesky_prepare(so_sparse_entries_t *AtA, 
 		invDiag = (float*)alloca(sizeof(float) * n);
 	}
 
+    // 初始化结果矩阵 L
 	so_sparse_entries_t L;
 	so_sparse_matrix_alloc(&L, (n / 16) * (n / 16));
 
-	int AtAindex = 0;
+	int AtAindex = 0; // 用于遍历输入矩阵 AtA
+	// 对每一行进行分解
 	for (int i = 0; i < n; i++)
 	{
-		int index_i_count = 0;
+		int index_i_count = 0;  // 当前行非零元素计数
 
-		int row_j_index = 0;
+		int row_j_index = 0;  // 用于遍历已计算的 L 行
+
+		// 计算当前行的每个元素
 		for (int j = 0; j <= i; j++)
 		{
 			//float sum = A[i * n + j]; // + (i == j ? 0.0001 : 0.0); // regularization
+			// 获取 AtA[i,j] 的值
 			int index = i * n + j;
 			float sum = 0.0f;
 			so_sparse_matrix_advance_to_index(AtA, &AtAindex, index, &sum);
 
+			// 减去已计算的 L[i,k]*L[j,k] 项
 			for (int k = 0; k < index_i_count; k++)
 			{
 				int index_i = indices_i[k];
@@ -916,6 +930,7 @@ static so_sparse_entries_t so_matrix_cholesky_prepare(so_sparse_entries_t *AtA, 
 					sum -= row_i[index_i] * Lvalue;
 			}
 
+			// 对角线元素特殊处理
 			if (i == j)
 			{
 				if (sum <= 0.0f)
@@ -923,9 +938,10 @@ static so_sparse_entries_t so_matrix_cholesky_prepare(so_sparse_entries_t *AtA, 
 					so_sparse_matrix_free(&L);
 					return L;
 				}
-				invDiag[i] = so_rsqrtf(sum);
+				invDiag[i] = so_rsqrtf(sum); // 计算对角线元素的倒数平方根
 			}
 
+			// 存储非零元素
 			if (SO_NOT_ZERO(sum))
 			{
 				row_i[j] = sum * invDiag[j];
@@ -947,49 +963,92 @@ static so_sparse_entries_t so_matrix_cholesky_prepare(so_sparse_entries_t *AtA, 
 	return L;
 }
 
+/*
+稀疏矩阵的 Cholesky 分解后向 de 求解过程，用于求解线性方程组 L(L^T)x = b
+- 使用预计算的 Cholesky 分解下三角矩阵 L 来求解线性方程组
+- 采用前向替换和后向替换两步法
+- 支持稀疏矩阵的高效求解
+*/
 static void so_matrix_cholesky_solve(so_sparse_entries_t *Lrows, so_sparse_entries_t *Lcols, float *x, const float *b, int n)
 {
+	/*
+	使用两个稀疏矩阵表示：
+	- Lrows: 按行存储的 L 矩阵
+	- Lcols: 按列存储的 L^T 矩阵
+	*/
 	float *y = (float*)alloca(sizeof(float) * n);
 
+	/*
+	前向替换：求解 L*y = b
+	前向替换阶段：
+	从上到下求解 L*y = b
+	利用行的稀疏性减少计算量
+	*/
 	// L * y = b
 	int Lindex = 0;
 	for (int i = 0; i < n; i++)
 	{
 		float sum = b[i];
+		// 遍历当前行的非零元素
 		while (Lindex < Lrows->count && Lrows->entries[Lindex].index < i * (n + 1))
 		{
 			sum -= Lrows->entries[Lindex].value * y[Lrows->entries[Lindex].index - i * n];
 			++Lindex;
 		}
-		assert(Lrows->entries[Lindex].index == i * (n + 1));
+		assert(Lrows->entries[Lindex].index == i * (n + 1)); // 确保找到对角线元素
 		y[i] = sum / Lrows->entries[Lindex].value;
 		++Lindex;
 	}
 
+	/*
+	后向替换：求解 L^T*x = y
+	后向替换阶段：
+	从下到上求解 L^T*x = y
+	利用列的稀疏性减少计算量
+	使用栈分配临时数组 y 以提高性能
+	*/
 	// L' * x = y
 	Lindex = Lcols->count - 1;
 	for (int i = n - 1; i >= 0; i--)
 	{
 		float sum = y[i];
+		// 遍历当前列的非零元素
 		while (Lindex >= 0 && Lcols->entries[Lindex].index > i * (n + 1))
 		{
 			sum -= Lcols->entries[Lindex].value * x[Lcols->entries[Lindex].index - i * n];
 			--Lindex;
 		}
-		assert(Lcols->entries[Lindex].index == i * (n + 1));
+		assert(Lcols->entries[Lindex].index == i * (n + 1)); // 确保找到对角线元素
 		x[i] = sum / Lcols->entries[Lindex].value;
 		--Lindex;
 	}
 }
 
+/*
+通过最小化接缝两侧的颜色差异来消除可见接缝
+代价函数：min Σ(缝合点两侧颜色差)^2 + λΣ(优化后颜色-原始颜色)^2
+优化问题转化为求解线性方程组：
+	A^T*A x = A^T*b
+- A矩阵编码了缝合点关系
+- b向量包含原始像素值
+- 使用Cholesky分解高效求解
+
+输入参数：
+seam: 包含需要优化的接缝信息（纹理坐标、缝合点等）
+data: 光贴图数据（w×h×c的浮点数组）
+w,h,c: 光贴图的宽、高和通道数
+lambda: 控制优化强度的权重参数（值越大越保持原始颜色）
+*/
 so_bool so_seam_optimize(so_seam_t *seam, float *data, int w, int h, int c, float lambda)
 {
-	so_texel_set_t *texels = &seam->texels;
-	so_stitching_points_t *stitchingPoints = &seam->stitchingPoints;
+	so_texel_set_t *texels = &seam->texels; // 获取接缝相关的所有纹理像素
+	so_stitching_points_t *stitchingPoints = &seam->stitchingPoints; // 获取缝合点
 
-	size_t m = stitchingPoints->count;
-	size_t n = texels->count;
+	// 2. 计算问题规模
+	size_t m = stitchingPoints->count; // 缝合点数量
+	size_t n = texels->count; // 涉及的纹理像素数量
 
+	// 3. 分配内存（一次性分配所有需要的内存块）
 	void *memoryBlock = so_alloc_void(
 		sizeof(so_texel_t) * n +
 		sizeof(float) * (m + n) * 8 +
@@ -1024,9 +1083,14 @@ so_bool so_seam_optimize(so_seam_t *seam, float *data, int w, int h, int c, floa
 
 	qsort(texelsFlat, n, sizeof(so_texel_t), so_texel_cmp);
 
+	// 4. 准备线性方程组 Ax = b 的矩阵
+	//    - A矩阵存储缝合点两侧的权重关系
+	//    - b向量存储原始像素值
 	size_t r = 0;
 	for (int i = 0; i < m; i++)
 	{
+		// 对每个缝合点，计算两侧4个纹理像素的权重关系
+    	// 并填充到A矩阵中
 		ptrdiff_t column0[4];
 		ptrdiff_t column1[4];
 		so_bool side0valid = SO_FALSE, side1valid = SO_FALSE;
@@ -1063,15 +1127,18 @@ so_bool so_seam_optimize(so_seam_t *seam, float *data, int w, int h, int c, floa
 
 	m = r;
 
+	// 5. 添加正则化项（防止过度偏离原始值）
 	// add error terms for deviation from original pixel value (scaled by lambda)
 	for (int i = 0; i < n; i++)
 	{
-		A[(m + i) * 8] = lambda;
+		A[(m + i) * 8] = lambda; // 对角线元素
 		AsparseIndices[(m + i) * 8 + 0] = i;
 		AsparseIndices[(m + i) * 8 + 1] = -1;
 	}
 
+	// 6. 构建法方程 A^T*A x = A^T*b
 	so_sparse_entries_t AtA = so_matrix_At_times_A(A, AsparseIndices, 8, m + n, n);
+	// 7. Cholesky分解预处理
 	so_sparse_entries_t L = so_matrix_cholesky_prepare(&AtA, n);
 	so_sparse_matrix_free(&AtA);
 
@@ -1087,15 +1154,19 @@ so_bool so_seam_optimize(so_seam_t *seam, float *data, int w, int h, int c, floa
 		so_sparse_matrix_add(&Lcols, (L.entries[i].index % n) * n + (L.entries[i].index / n), L.entries[i].value);
 	so_sparse_matrix_sort(&Lcols);
 
+	// 8. 对每个颜色通道独立求解
 	// solve each color channel independently
   	for (int ci = 0; ci < c; ci++)
 	{
+		// 准备右侧向量b
 		for (int i = 0; i < n; i++)
 			b[m + i] = lambda * data[(texelsFlat[i].y * w + texelsFlat[i].x) * c + ci];
-
 		so_matrix_At_times_b(A, m + n, n, b, Atb, AsparseIndices, 8);
+
+		// 求解线性方程组
 		so_matrix_cholesky_solve(&L, &Lcols, x, Atb, n);
 
+		// 将结果写回光贴图
 		// write out results
 		for (int i = 0; i < n; i++)
 			data[(texelsFlat[i].y * w + texelsFlat[i].x) * c + ci] = x[i];
