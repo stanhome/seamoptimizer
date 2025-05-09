@@ -918,7 +918,7 @@ static so_sparse_entries_t so_matrix_cholesky_prepare(so_sparse_entries_t *AtA, 
 			//float sum = A[i * n + j]; // + (i == j ? 0.0001 : 0.0); // regularization
 			// 获取 AtA[i,j] 的值
 			int index = i * n + j;
-			float sum = 0.0f;
+			float sum = 0.0f; /* 从A矩阵获取A[i,j] */
 			so_sparse_matrix_advance_to_index(AtA, &AtAindex, index, &sum);
 
 			// 减去已计算的 L[i,k]*L[j,k] 项
@@ -927,7 +927,7 @@ static so_sparse_entries_t so_matrix_cholesky_prepare(so_sparse_entries_t *AtA, 
 				int index_i = indices_i[k];
 				float Lvalue;
 				if (so_sparse_matrix_advance_to_index(&L, &row_j_index, j * n + index_i, &Lvalue))
-					sum -= row_i[index_i] * Lvalue;
+					sum -= row_i[index_i] * Lvalue /* L[j][k] */;
 			}
 
 			// 对角线元素特殊处理
